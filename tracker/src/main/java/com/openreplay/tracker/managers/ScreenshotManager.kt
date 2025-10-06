@@ -41,6 +41,7 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.Executors
 import java.util.zip.GZIPOutputStream
 import kotlin.coroutines.suspendCoroutine
+import kotlin.text.compareTo
 
 object ScreenshotManager {
     private var lastTs: String = ""
@@ -86,6 +87,7 @@ object ScreenshotManager {
     }
 
     fun addSanitizedElement(view: View) {
+        logDebug("Adding sanitized view: $view")
         if (OpenReplay.options.debugLogs) {
             DebugUtils.log("Sanitizing view: $view")
         }
@@ -226,6 +228,7 @@ object ScreenshotManager {
     }
 
     private fun oldViewToBitmap(view: View): Bitmap {
+        logDebug("oldViewToBitmap: Zrzut ekranu dla widoku: ${view::class.java.name}")
         val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         view.draw(canvas)
@@ -389,17 +392,24 @@ object ScreenshotManager {
         }
     }
 
+    private fun logDebug(message: String) {
+        println("SCREENSHOT_DEBUG" + message)
+    }
+
     private fun Activity.screenShot(result: (Bitmap) -> Unit) {
+        logDebug(this.applicationContext.packageName)
         val activity = this
         val view = window.decorView.rootView
+        logDebug("screenShot: Rozpoczynam zrzut ekranu dla widoku: ${view::class.java.name}")
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // New version of Android, should use PixelCopy
+            logDebug("screenShot: Używam PixelCopy (Android >= O)")
             val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
             val location = IntArray(2)
             view.getLocationInWindow(location)
+            logDebug("screenShot: Lokalizacja widoku w oknie: x=${location[0]}, y=${location[1]}")
 
-
-            if (!activity.isFinishing)
+            if (!activity.isFinishing) {
                 PixelCopy.request(
                     activity.window,
                     Rect(
@@ -408,16 +418,19 @@ object ScreenshotManager {
                         location[0] + view.width,
                         location[1] + view.height
                     ),
-                    bitmap, {
-                        if (it == PixelCopy.SUCCESS) {
+                    bitmap, { resultCode ->
+                        logDebug("screenShot: PixelCopy zakończony z kodem: $resultCode")
+                        if (resultCode == PixelCopy.SUCCESS) {
+                            logDebug("screenShot: PixelCopy SUCCESS, zwracam bitmapę")
                             result(bitmap)
                         }
                     },
                     Handler(mainLooper)
                 )
-        } else {
-            // Old version can keep using view.draw
-            result(oldViewToBitmap(view))
+            } else {
+                logDebug("screenShot: Aktywność jest stara jak świat, używam starej metody")
+                result(oldViewToBitmap(view))
+            }
         }
     }
 

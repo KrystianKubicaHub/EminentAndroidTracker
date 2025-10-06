@@ -8,6 +8,7 @@ pluginManagement {
             }
         }
         mavenCentral()
+        mavenLocal()
         gradlePluginPortal()
     }
 }
@@ -19,6 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "OpenReplayAndroid"
-include(":app")
+rootProject.name = "EminentAndroidTracker"
 include(":tracker")

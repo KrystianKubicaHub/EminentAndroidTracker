@@ -369,12 +369,12 @@ fun getCaptureSettings(fps: Int, quality: RecordingQuality): Triple<Int, Int, In
     val captureRate = 1000 / limitedFPS // Milliseconds per frame
 
     val imgCompression = when (quality) {
-        RecordingQuality.Low -> 10
+        RecordingQuality.Low -> 5
         RecordingQuality.Standard -> 30
         RecordingQuality.High -> 60
     }
     val imgResolution = when (quality) {
-        RecordingQuality.Low -> 480
+        RecordingQuality.Low -> 240
         RecordingQuality.Standard -> 720
         RecordingQuality.High -> 1080
     }

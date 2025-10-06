@@ -2,6 +2,7 @@ package com.openreplay.sampleapp
 
 import android.os.Bundle
 import android.view.MotionEvent
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.navigation.findNavController
 import androidx.navigation.ui.AppBarConfiguration
@@ -51,11 +52,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun startOpenReplay() {
         OpenReplay.setupGestureDetector(this)
-        // OpenReplay.serverURL = BuildConfig.SERVER_URL
-        OpenReplay.setUserID("TEST")
+        OpenReplay.serverURL = "https://api.openreplay.com/ingest"
+        OpenReplay.setUserID("TEST2")
         OpenReplay.start(
             context = this,
-            projectKey = BuildConfig.PROJECT_KEY,
+            projectKey = "l9R0ymxHiGJ3wBV1D6on",
             options = OROptions(screen = true, logs = true, wifiOnly = false),
             onStarted = {
                 OpenReplay.event("Test Event", User("John Doe", 25))
@@ -64,10 +65,12 @@ class MainActivity : AppCompatActivity() {
                 OpenReplay.event("Session ID", id)
             }
         )
+        Toast.makeText(this, "OpenReplay started", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopOpenReplay() {
         OpenReplay.stop()
+        Toast.makeText(this, "OpenReplay stopped", Toast.LENGTH_SHORT).show()
     }
 
     private data class User(val name: String, val age: Int)
