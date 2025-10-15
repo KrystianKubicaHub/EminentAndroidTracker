@@ -1,6 +1,5 @@
 package com.openreplay.tracker.managers
 
-import NetworkManager
 import com.openreplay.tracker.OpenReplay
 import com.openreplay.tracker.models.ORMessage
 import com.openreplay.tracker.models.script.*
@@ -164,18 +163,31 @@ object ConditionsManager {
     }
 
     private fun durationCond(dur: List<String>) {
+        val thresholds = dur.mapNotNull { it.toLongOrNull() }
+        if (thresholds.isEmpty()) {
+            DebugUtils.log("[ConditionsManager] Brak poprawnych wartości duration")
+            return
+        }
+
         val scheduler = Executors.newSingleThreadScheduledExecutor()
         var scheduledFuture: ScheduledFuture<*>? = null
 
-        scheduledFuture = scheduler.scheduleAtFixedRate({
-            val now = System.currentTimeMillis()
-            val diff = now - OpenReplay.sessionStartTs
-            if (dur.any { (it.toLongOrNull() ?: 9999999L) <= diff }) {
-//                OpenReplay.triggerRecording(name)
-                scheduledFuture?.cancel(false) // Cancel the scheduled task after triggering
+        scheduledFuture = scheduler.scheduleWithFixedDelay({
+            val start = OpenReplay.getSessionStartTimestamp()
+            if (start <= 0L) return@scheduleWithFixedDelay
+
+            val diff = System.currentTimeMillis() - start
+            if (thresholds.any { diff >= it }) {
+                DebugUtils.log("[ConditionsManager] Triggered after ${diff}ms → starting recording")
+                OpenReplay.triggerRecordingByCondition("duration_trigger")
+                scheduledFuture?.cancel(false)
+                scheduler.shutdown()
             }
-        }, 1, 1, TimeUnit.SECONDS) // Schedule the task to run every second
+        }, 1, 1, TimeUnit.SECONDS)
     }
+
+
+
 }
 
 object OperatorsManager {

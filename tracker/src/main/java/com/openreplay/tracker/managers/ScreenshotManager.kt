@@ -1,35 +1,29 @@
 package com.openreplay.tracker.managers
 
-import NetworkManager
-import NetworkManager.sessionId
 import android.app.Activity
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapShader
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Rect
-import android.graphics.Shader
+import android.graphics.*
 import android.os.Build
 import android.os.Handler
 import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
 import androidx.compose.ui.platform.AbstractComposeView
-import androidx.compose.ui.platform.ComposeView
-import com.openreplay.tracker.OpenReplay
 import com.openreplay.tracker.SanitizableViewGroup
+import com.openreplay.tracker.managers.NetworkManager.sessionId
+import com.openreplay.tracker.models.OROptions
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream
@@ -38,409 +32,414 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.lang.ref.WeakReference
-import java.util.concurrent.Executors
-import java.util.zip.GZIPOutputStream
-import kotlin.coroutines.suspendCoroutine
-import kotlin.text.compareTo
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.math.roundToInt
 
 object ScreenshotManager {
-    private var lastTs: String = ""
     private var firstTs: String = ""
-    private var sanitizedElements: MutableList<View> = mutableListOf()
-    private var quality: Int = 10
-    private var minResolution: Int = 320
-    private lateinit var uiContext: WeakReference<Context>
+    private var lastTs: String = ""
+    private var quality: Int = 30
+    private var minResolution: Int = 720
 
-    private var screenShotJob: Job? = null
-    private val scope = CoroutineScope(SupervisorJob()
-            + Dispatchers.IO
-            + CoroutineExceptionHandler { _, throwable ->
-        DebugUtils.error(throwable)
-    })
+    private val sanitizedElements: MutableList<View> = mutableListOf()
+
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, t -> DebugUtils.error(t) }
+    )
+    private var job: Job? = null
+
+    @Volatile private var sessionRunning = AtomicBoolean(false)
+    @Volatile private var uiContextRef: WeakReference<Context> = WeakReference(null)
+    @Volatile private var currentActivityRef: WeakReference<Activity> = WeakReference(null)
+
+    private var frameIntervalMs: Long = 500L
 
     fun setSettings(settings: Triple<Int, Int, Int>) {
-        val (_, quality, resolution) = settings
-        this.quality = quality
-        this.minResolution = resolution
+        val (interval, q, res) = settings
+        frameIntervalMs = interval.coerceAtLeast(250).toLong()
+        quality = q
+        minResolution = res
+    }
+    fun logDebug(string: String){
+        println("OpenReplay ::: ScreenshotManager: $string")
     }
 
-    fun start(context: Context, startTs: Long) {
-        uiContext = WeakReference(context)
-        firstTs = startTs.toString()
-        val intervalMillis =
-            OpenReplay.options.screenshotFrequency.millis / OpenReplay.options.fps.toLong()
+    fun start(context: Context, startTs: Long, options: OROptions) {
+        if (sessionRunning.get()) {
+            logDebug("DEBUG: session already running, skipping start()")
+            return
+        }
+        sessionRunning.set(true)
 
-        // endless job to perform screen shot managing
-        screenShotJob = scope.launch {
-            while (true) {
-                delay(intervalMillis)
-                launch { makeScreenshotAndSaveWithArchive() }
-                launch { sendScreenshotArchives() }
+        uiContextRef = WeakReference(context.applicationContext)
+        firstTs = startTs.toString()
+
+        runCatching {
+            val screenshotsDir = getScreenshotFolder()
+            val archivesDir = getArchiveFolder()
+            val removedScreens = screenshotsDir.listFiles()?.onEach { it.delete() }?.size ?: 0
+            val removedArchives = archivesDir.listFiles()?.onEach { it.delete() }?.size ?: 0
+            logDebug("DEBUG: cleaned screenshots=$removedScreens, archives=$removedArchives")
+        }.onFailure {
+            logDebug("DEBUG: failed to clean folders - ${it.message}")
+        }
+
+        logDebug(
+            "DEBUG: ScreenshotManager starting at ${System.currentTimeMillis()} " +
+                    "with FPS=${options.fps}, quality=${options.screenshotQuality}, " +
+                    "interval=${frameIntervalMs}ms"
+        )
+
+        job?.cancel()
+        job = scope.launch {
+            while (isActive && sessionRunning.get()) {
+                delay(frameIntervalMs)
+
+                val bmp = captureScreenshot()
+                if (bmp == null) {
+                    logDebug("DEBUG: captureScreenshot() returned null, skipping frame")
+                    continue
+                }
+
+                logDebug("DEBUG: captured bitmap size=${bmp.width}x${bmp.height}")
+
+                saveAndMaybeArchive(bmp, chunk = 10)
             }
         }
     }
 
 
     fun stop() {
-        screenShotJob?.cancel()
-        terminate()
+        if (!sessionRunning.getAndSet(false)) return
+        job?.cancel()
+        scope.coroutineContext.cancelChildren()
+
+        scope.launch {
+            runCatching {
+                archivateFolder(getScreenshotFolder())
+                sendScreenshotArchives()
+            }.onFailure { DebugUtils.error("Error during termination: ${it.message}") }
+        }
+    }
+
+    fun updateCurrentActivity(activity: Activity?) {
+        currentActivityRef = WeakReference(activity)
     }
 
     fun addSanitizedElement(view: View) {
-        logDebug("Adding sanitized view: $view")
-        if (OpenReplay.options.debugLogs) {
-            DebugUtils.log("Sanitizing view: $view")
-        }
+        DebugUtils.log("Sanitize view: $view")
         sanitizedElements.add(view)
     }
 
     fun removeSanitizedElement(view: View) {
-        if (OpenReplay.options.debugLogs) {
-            DebugUtils.log("Removing sanitized view: $view")
-        }
         sanitizedElements.remove(view)
     }
 
-    private suspend fun sendScreenshotArchives() = withContext(Dispatchers.IO) {
+    private suspend fun saveAndMaybeArchive(bitmap: Bitmap, chunk: Int) = withContext(Dispatchers.IO) {
         try {
-            val archives = getArchiveFolder().listFiles().orEmpty()
-            if (archives.isEmpty()) return@withContext
+            val folder = getScreenshotFolder()
+            if (!folder.exists()) {
+                folder.mkdirs()
+                DebugUtils.log("::: ScreenshotManager: DEBUG: Created screenshot folder: ${folder.absolutePath}")
+            }
 
-            archives.forEach { archive ->
+            val filename = "${System.currentTimeMillis()}.jpeg"
+            val file = File(folder, filename)
+            val compressed = compress(bitmap)
+            FileOutputStream(file).use { out ->
+                out.write(compressed)
+            }
+
+            DebugUtils.log("::: ScreenshotManager: DEBUG: Saved screenshot → ${file.name} (${compressed.size / 1024} KB)")
+
+            val count = folder.listFiles()?.size ?: 0
+            DebugUtils.log("::: ScreenshotManager: DEBUG: Total screenshots in folder: $count (chunk limit = $chunk)")
+
+            if (count >= chunk) {
+                DebugUtils.log("::: ScreenshotManager: DEBUG: Reached $count screenshots, starting archivation...")
+                archivateFolder(folder)
+            } else {
+                DebugUtils.log("::: ScreenshotManager: DEBUG: Not archiving yet — need ${chunk - count} more screenshots.")
+            }
+
+        } catch (e: Exception) {
+            DebugUtils.log("::: ScreenshotManager: ERROR in saveAndMaybeArchive → ${e.message}")
+        }
+    }
+
+
+    private suspend fun sendScreenshotArchives() = withContext(Dispatchers.IO) {
+        val archives = getArchiveFolder().listFiles().orEmpty()
+
+        if (archives.isEmpty()) {
+            DebugUtils.log("[Screenshots] No archives found to upload.")
+            return@withContext
+        }
+
+        val key = NetworkManager.projectKey
+        val tokenSet = NetworkManager.token != null
+        DebugUtils.log(
+            "[Screenshots] Preparing to send ${archives.size} archives; " +
+                    "projectKey=$key, tokenSet=$tokenSet, thread=${Thread.currentThread().name}"
+        )
+        archives.forEachIndexed { i, archive ->
+            DebugUtils.log("[Screenshots] #$i ${archive.name} size=${archive.length()}B")
+        }
+
+
+        archives.forEach { archive ->
+            try {
+
+                if (key.isNullOrBlank()) {
+                    DebugUtils.log("[Screenshots] Skipping ${archive.name} – projectKey is null or blank")
+                    return@forEach
+                }
+
+                val bytes = archive.readBytes()
+                DebugUtils.log("[Screenshots] Uploading ${archive.name} (${bytes.size}B)...")
+
                 NetworkManager.sendImages(
-                    projectKey = OpenReplay.projectKey!!,
-                    images = archive.readBytes(),
+                    projectKey = key,
+                    images = bytes,
                     name = archive.name
                 ) { success ->
-                    scope.launch {
-                        if (success) {
-                            archive.deleteSafely()
+                    if (success) {
+                        DebugUtils.log("[Screenshots]ploaded ${archive.name} successfully — keeping file for inspection")
+
+                        // scope.launch(Dispatchers.IO) { archive.deleteSafely() }
+                    } else {
+                        DebugUtils.log("[Screenshots] Upload failed for ${archive.name}")
+                    }
+                }
+            } catch (e: Exception) {
+                DebugUtils.log("[Screenshots] Exception while sending ${archive.name}: ${e.message}")
+            }
+        }
+    }
+
+
+
+    private fun archivateFolder(folder: File) {
+        try {
+            val screenshots = folder.listFiles().orEmpty().sortedBy { it.lastModified() }
+            if (screenshots.isEmpty()) {
+                DebugUtils.log("::: ScreenshotManager: DEBUG: archivateFolder() → no screenshots found, skipping.")
+                return
+            }
+
+            val totalSizeKb = screenshots.sumOf { it.length() } / 1024
+            DebugUtils.log("::: ScreenshotManager: DEBUG: archivateFolder() → Found ${screenshots.size} screenshots, total=${totalSizeKb}KB")
+
+            val combined = ByteArrayOutputStream()
+
+            GzipCompressorOutputStream(combined).use { gzos ->
+                TarArchiveOutputStream(gzos).use { tar ->
+                    screenshots.forEachIndexed { index, jpeg ->
+                        try {
+                            lastTs = jpeg.nameWithoutExtension
+                            val filename = "${firstTs}_1_${jpeg.nameWithoutExtension}.jpeg"
+                            val data = jpeg.readBytes()
+                            val entry = TarArchiveEntry(filename).apply { size = data.size.toLong() }
+                            tar.putArchiveEntry(entry)
+                            ByteArrayInputStream(data).copyTo(tar)
+                            tar.closeArchiveEntry()
+
+                            DebugUtils.log("::: ScreenshotManager: DEBUG: Added file [${index + 1}/${screenshots.size}] → ${jpeg.name} (${data.size / 1024}KB)")
+                        } catch (e: Exception) {
+                            DebugUtils.log("::: ScreenshotManager: ERROR: Failed to add ${jpeg.name} to archive: ${e.message}")
                         }
                     }
                 }
             }
-        } catch (e: Exception) {
-            DebugUtils.error("Error sending screenshot archives: ${e.message}")
-        }
-    }
 
-    private suspend fun makeScreenshotAndSaveWithArchive(chunk: Int = 10) {
-        // compress add screen shot to storage and archive
-        // create picture
-        coroutineScope {
-            try {
-                // DebugUtils.log("make screenshot")
-                val screenShotBitmap = withContext(Dispatchers.Main) { captureScreenshot() }
-                // get or create folder
-                val screenShotFolder = getScreenshotFolder()
-                val screenShotFile = File(screenShotFolder, "${System.currentTimeMillis()}.jpeg")
-                // DebugUtils.log("save screenshot")
-                // save screen shot
-                FileOutputStream(screenShotFile).use { out -> out.write(compress(screenShotBitmap)) }
-                // make archive for $chunk pictures
-                //  for example archivate folder for 10 pictures minimum
-                if (screenShotFolder.listFiles().orEmpty().size >= chunk) {
-                    archivateFolder(folder = screenShotFolder)
-                }
-            } catch (e: Exception) {
-                DebugUtils.error(e)
-            }
-        }
-    }
+            val archive = File(getArchiveFolder(), "$sessionId-$lastTs.tar.gz")
+            FileOutputStream(archive).use { it.write(combined.toByteArray()) }
 
-    private fun terminate() {
-        scope.launch {
-            try {
-                val screenshotFolder = getScreenshotFolder()
-                archivateFolder(screenshotFolder)
+            DebugUtils.log("::: ScreenshotManager: DEBUG: Archive created → ${archive.absolutePath} (${archive.length() / 1024}KB)")
+            DebugUtils.log("::: ScreenshotManager: DEBUG: Archive contains ${screenshots.size} screenshots, total before compression=${totalSizeKb}KB")
+
+            // scope.launch(Dispatchers.IO) { screenshots.forEach { it.deleteSafely() } }
+            // DebugUtils.log("::: ScreenshotManager: DEBUG: Deleted ${screenshots.size} screenshots after archivation")
+
+            scope.launch(Dispatchers.IO) {
+                DebugUtils.log("::: ScreenshotManager: DEBUG: Triggering sendScreenshotArchives() after archivation...")
                 sendScreenshotArchives()
-            } catch (e: Exception) {
-                DebugUtils.error("Error during termination: ${e.message}")
             }
+
+        } catch (e: Exception) {
+            DebugUtils.log("::: ScreenshotManager: ERROR: archivateFolder() failed → ${e.message}")
         }
     }
 
-
-    private fun archivateFolder(folder: File) {
-        val screenshots = folder.listFiles().orEmpty().sortedBy { it.lastModified() }
-
-        // combine chunked data to zip
-        val combinedData = ByteArrayOutputStream()
-        GzipCompressorOutputStream(combinedData).use { gzos ->
-            TarArchiveOutputStream(gzos).use { tarOs ->
-                screenshots.forEach { jpeg ->
-                    lastTs = jpeg.nameWithoutExtension
-                    val filename = "${firstTs}_1_${jpeg.nameWithoutExtension}.jpeg"
-                    val readBytes = jpeg.readBytes()
-                    val tarEntry = TarArchiveEntry(filename)
-                    tarEntry.size = readBytes.size.toLong()
-                    tarOs.putArchiveEntry(tarEntry)
-                    ByteArrayInputStream(readBytes).copyTo(tarOs)
-                    tarOs.closeArchiveEntry()
-                }
-            }
-        }
-        val archiveFolder = getArchiveFolder()
-        val archiveFile = File(archiveFolder, "$sessionId-$lastTs.tar.gz")
-        FileOutputStream(archiveFile).use { out -> out.write(combinedData.toByteArray()) }
-
-        scope.launch {
-            screenshots.forEach { it.deleteSafely() }
-        }
-    }
-
-//    private fun getArchiveFolder(): File {
-//        val context = uiContext.get() ?: throw IllegalStateException("No context")
-//        val archiveFolder = File(context.filesDir, "archives")
-//        if (!archiveFolder.exists()) {
-//            archiveFolder.mkdir()
-//        }
-//        return archiveFolder
-//    }
 
     private fun getArchiveFolder(): File {
-        val context = uiContext.get() ?: throw IllegalStateException("No context")
-        return File(context.filesDir, "archives").apply { mkdirs() }
+        val ctx = uiContextRef.get() ?: throw IllegalStateException("No context")
+        return File(ctx.filesDir, "archives").apply { mkdirs() }
     }
 
     private fun getScreenshotFolder(): File {
-        val context = uiContext.get() ?: throw IllegalStateException("No context")
-        return File(context.filesDir, "screenshots").apply { mkdirs() }
+        val ctx = uiContextRef.get() ?: throw IllegalStateException("No context")
+        return File(ctx.filesDir, "screenshots").apply { mkdirs() }
     }
 
-//    private fun getScreenshotFolder(): File {
-//        val context = uiContext.get() ?: throw IllegalStateException("No context")
-//        val screenShotFolder = File(context.filesDir, "screenshots")
-//        if (!screenShotFolder.exists()) {
-//            screenShotFolder.mkdir()
-//        }
-//        return screenShotFolder
-//    }
 
-    private suspend fun captureScreenshot(): Bitmap {
-        val activity =
-            uiContext.get() as? Activity ?: throw IllegalStateException("No Activity")
-        return suspendCoroutine { coroutine ->
-            activity.screenShot { shot ->
-                coroutine.resumeWith(Result.success(shot))
-            }
-        }
-    }
+    private suspend fun captureScreenshot(): Bitmap? {
+        val activity = currentActivityRef.get() ?: return null
+        if (activity.isFinishing || activity.isDestroyed) return null
 
-    private fun oldViewToBitmap(view: View): Bitmap {
-        logDebug("oldViewToBitmap: Zrzut ekranu dla widoku: ${view::class.java.name}")
-        val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        view.draw(canvas)
+        return withContext(Dispatchers.Main) {
+            withTimeoutOrNull(1200) {
+                suspendCancellableCoroutine { cont ->
+                    val window = activity.window ?: run { cont.resume(null); return@suspendCancellableCoroutine }
+                    val rootView = window.decorView.rootView
 
-        // Handle Jetpack Compose views
-        if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
-                val child = view.getChildAt(i)
-                if (child is AbstractComposeView) {
-                    child.draw(canvas)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        val bitmap = Bitmap.createBitmap(
+                            rootView.width.coerceAtLeast(1),
+                            rootView.height.coerceAtLeast(1),
+                            Bitmap.Config.ARGB_8888
+                        )
+                        val location = IntArray(2).also { rootView.getLocationInWindow(it) }
+                        val handler = Handler(activity.mainLooper)
+
+                        var delivered = false
+                        val timeout = Runnable {
+                            if (!delivered) {
+                                delivered = true
+                                cont.resume(oldViewToBitmap(rootView))
+                            }
+                        }
+                        handler.postDelayed(timeout, 500)
+
+                        runCatching {
+                            PixelCopy.request(
+                                window,
+                                Rect(location[0], location[1], location[0] + rootView.width, location[1] + rootView.height),
+                                bitmap,
+                                { result ->
+                                    handler.removeCallbacks(timeout)
+                                    if (delivered) return@request
+                                    delivered = true
+                                    if (result == PixelCopy.SUCCESS) {
+                                        cont.resume(bitmap)
+                                    } else {
+                                        cont.resume(oldViewToBitmap(rootView))
+                                    }
+                                },
+                                handler
+                            )
+                        }.onFailure {
+                            handler.removeCallbacks(timeout)
+                            if (!delivered) {
+                                delivered = true
+                                cont.resume(null)
+                            }
+                        }
+                    } else {
+                        cont.resume(oldViewToBitmap(rootView))
+                    }
                 }
             }
         }
+    }
 
-        // Draw masks over sanitized elements
-        sanitizedElements.forEach { sanitizedView ->
-            if (sanitizedView.visibility == View.VISIBLE && sanitizedView.isAttachedToWindow) {
-                val location = IntArray(2)
-                sanitizedView.getLocationInWindow(location)
-                val rootViewLocation = IntArray(2)
-                view.getLocationInWindow(rootViewLocation)
-                val x = location[0] - rootViewLocation[0]
-                val y = location[1] - rootViewLocation[1]
+    private fun oldViewToBitmap(view: View): Bitmap? {
+        if (view.width <= 0 || view.height <= 0) return null
+        val bmp = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        view.draw(canvas)
 
-                // Draw the striped mask over the sanitized view
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                val child = view.getChildAt(i)
+                if (child is AbstractComposeView) child.draw(canvas)
+            }
+        }
+
+        sanitizedElements.forEach { sanitized ->
+            if (sanitized.visibility == View.VISIBLE && sanitized.isAttachedToWindow) {
+                val loc = IntArray(2)
+                sanitized.getLocationInWindow(loc)
+                val rootLoc = IntArray(2)
+                view.getLocationInWindow(rootLoc)
+                val x = (loc[0] - rootLoc[0]).toFloat()
+                val y = (loc[1] - rootLoc[1]).toFloat()
                 canvas.save()
-                canvas.translate(x.toFloat(), y.toFloat())
-                canvas.drawRect(
-                    0f,
-                    0f,
-                    sanitizedView.width.toFloat(),
-                    sanitizedView.height.toFloat(),
-                    maskPaint
-                )
+                canvas.translate(x, y)
+                canvas.drawRect(0f, 0f, sanitized.width.toFloat(), sanitized.height.toFloat(), maskPaint)
                 canvas.restore()
             }
         }
 
-        fun iterateComposeView(vv: View) {
-            if (vv is ViewGroup) {
-                for (i in 0 until vv.childCount) {
-                    val child = vv.getChildAt(i)
-                    println("iterateComposeView child: ${child::class.java.name}")
-
-                    if (child is SanitizableViewGroup) {
-                        println("SanitizableViewGroup")
-                        val location = IntArray(2)
-                        child.getLocationInWindow(location)
-                        val rootViewLocation = IntArray(2)
-                        view.getLocationInWindow(rootViewLocation)
-                        val x = location[0] - rootViewLocation[0]
-                        val y = location[1] - rootViewLocation[1]
-
-                        canvas.save()
-                        canvas.translate(x.toFloat(), y.toFloat())
-                        canvas.drawRect(
-                            0f,
-                            0f,
-                            child.width.toFloat(),
-                            child.height.toFloat(),
-                            maskPaint
-                        )
-                        canvas.restore()
-                    } else if (child is ViewGroup) {
-                        iterateComposeView(child)
+        fun iterateCompose(v: View) {
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) {
+                    val c = v.getChildAt(i)
+                    when (c) {
+                        is SanitizableViewGroup -> {
+                            val loc = IntArray(2)
+                            c.getLocationInWindow(loc)
+                            val rootLoc = IntArray(2)
+                            view.getLocationInWindow(rootLoc)
+                            val x = (loc[0] - rootLoc[0]).toFloat()
+                            val y = (loc[1] - rootLoc[1]).toFloat()
+                            canvas.save()
+                            canvas.translate(x, y)
+                            canvas.drawRect(0f, 0f, c.width.toFloat(), c.height.toFloat(), maskPaint)
+                            canvas.restore()
+                        }
+                        is ViewGroup -> iterateCompose(c)
                     }
                 }
             }
         }
+        iterateCompose(view)
 
-        fun iterateViewGroup(viewGroup: ViewGroup) {
-            for (i in 0 until viewGroup.childCount) {
-                val child = viewGroup.getChildAt(i)
-                if (child is ViewGroup) {
-                    iterateViewGroup(child)
-                }
-
-                if (child is ComposeView) {
-                    iterateComposeView(child)
-                }
-
-                if (child is SanitizableViewGroup) {
-                    iterateComposeView(child)
-                }
-            }
-        }
-
-        iterateViewGroup(view as ViewGroup)
-
-        return bitmap
+        return bmp
     }
 
     private val maskPaint = Paint().apply {
         style = Paint.Style.FILL
-        val patternBitmap = createCrossStripedPatternBitmap()
-        shader = BitmapShader(patternBitmap, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+        shader = BitmapShader(createCrossStripedPattern(), Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     }
 
-    private fun createCrossStripedPatternBitmap(): Bitmap {
-        val patternSize = 80
-        val patternBitmap =
-            Bitmap.createBitmap(patternSize, patternSize, Bitmap.Config.ARGB_8888)
-        val patternCanvas = Canvas(patternBitmap)
-        val paint = Paint().apply {
-            color = Color.DKGRAY
-            style = Paint.Style.FILL
-        }
-
-        patternCanvas.drawColor(Color.WHITE)
-
-        val stripeWidth = 20f
-        val gap = stripeWidth / 4
-        for (i in -patternSize until patternSize * 2 step (stripeWidth + gap).toInt()) {
-            patternCanvas.drawLine(
-                i.toFloat(),
-                -gap,
-                i.toFloat() + patternSize,
-                patternSize.toFloat() + gap,
-                paint
-            )
-        }
-
-        patternCanvas.rotate(90f, patternSize / 2f, patternSize / 2f)
-
-        for (i in -patternSize until patternSize * 2 step (stripeWidth + gap).toInt()) {
-            patternCanvas.drawLine(
-                i.toFloat(),
-                -gap,
-                i.toFloat() + patternSize,
-                patternSize.toFloat() + gap,
-                paint
-            )
-        }
-
-        return patternBitmap
-    }
-
-    private fun gzipCompress(data: ByteArray): ByteArray {
-        ByteArrayOutputStream().use { byteArrayOutputStream ->
-            GZIPOutputStream(byteArrayOutputStream).use { gzipOutputStream ->
-                gzipOutputStream.write(data)
+    private fun createCrossStripedPattern(): Bitmap {
+        val size = 80
+        val b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.DKGRAY; style = Paint.Style.STROKE; strokeWidth = 6f }
+        c.drawColor(Color.WHITE)
+        fun drawDiag() {
+            var i = -size
+            while (i < size * 2) {
+                c.drawLine(i.toFloat(), 0f, (i + size).toFloat(), size.toFloat(), p)
+                i += 24
             }
-            return byteArrayOutputStream.toByteArray()
         }
+        drawDiag()
+        c.rotate(90f, size / 2f, size / 2f)
+        drawDiag()
+        return b
     }
 
-    private suspend fun compress(originalBitmap: Bitmap): ByteArray = suspendCoroutine {
-        ByteArrayOutputStream().use { outputStream ->
-            val aspectRatio = originalBitmap.height.toFloat() / originalBitmap.width.toFloat()
-            val newHeight = (minResolution * aspectRatio).toInt()
-
-            val updated =
-                Bitmap.createScaledBitmap(originalBitmap, minResolution, newHeight, true)
-
+    private suspend fun compress(bmp: Bitmap): ByteArray = withContext(Dispatchers.Default) {
+        ByteArrayOutputStream().use { out ->
+            val aspect = bmp.height.toFloat() / bmp.width.toFloat()
+            val h = (minResolution * aspect).roundToInt().coerceAtLeast(1)
+            val scaled = Bitmap.createScaledBitmap(bmp, minResolution, h, true)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                updated.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, quality, outputStream)
+                scaled.compress(Bitmap.CompressFormat.WEBP_LOSSLESS, quality, out)
             } else {
-                updated.compress(Bitmap.CompressFormat.JPEG, quality, outputStream)
+                scaled.compress(Bitmap.CompressFormat.JPEG, quality, out)
             }
-            it.resumeWith(Result.success(outputStream.toByteArray()))
-        }
-    }
-
-    private fun logDebug(message: String) {
-        println("SCREENSHOT_DEBUG" + message)
-    }
-
-    private fun Activity.screenShot(result: (Bitmap) -> Unit) {
-        logDebug(this.applicationContext.packageName)
-        val activity = this
-        val view = window.decorView.rootView
-        logDebug("screenShot: Rozpoczynam zrzut ekranu dla widoku: ${view::class.java.name}")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            logDebug("screenShot: Używam PixelCopy (Android >= O)")
-            val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
-            val location = IntArray(2)
-            view.getLocationInWindow(location)
-            logDebug("screenShot: Lokalizacja widoku w oknie: x=${location[0]}, y=${location[1]}")
-
-            if (!activity.isFinishing) {
-                PixelCopy.request(
-                    activity.window,
-                    Rect(
-                        location[0],
-                        location[1],
-                        location[0] + view.width,
-                        location[1] + view.height
-                    ),
-                    bitmap, { resultCode ->
-                        logDebug("screenShot: PixelCopy zakończony z kodem: $resultCode")
-                        if (resultCode == PixelCopy.SUCCESS) {
-                            logDebug("screenShot: PixelCopy SUCCESS, zwracam bitmapę")
-                            result(bitmap)
-                        }
-                    },
-                    Handler(mainLooper)
-                )
-            } else {
-                logDebug("screenShot: Aktywność jest stara jak świat, używam starej metody")
-                result(oldViewToBitmap(view))
-            }
+            out.toByteArray()
         }
     }
 
     private fun File.deleteSafely() {
-        if (exists()) {
-            try {
-                delete()
-            } catch (e: Exception) {
-                DebugUtils.error("Error deleting file: ${e.message}")
-            }
+        if (exists()) runCatching { delete() }.onFailure {
+            DebugUtils.error("Error deleting file: ${it.message}")
         }
     }
 }

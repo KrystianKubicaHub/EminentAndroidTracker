@@ -2,11 +2,11 @@ package com.openreplay.tracker.listeners
 
 import android.content.Context
 import com.openreplay.tracker.managers.DebugUtils
+import com.openreplay.tracker.managers.NetworkManager
 import com.openreplay.tracker.models.script.ORMobileCrash
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.lang.ref.WeakReference
 
@@ -16,87 +16,86 @@ object Crash {
     private var contextRef: WeakReference<Context>? = null
 
     fun init(context: Context) {
-        contextRef = WeakReference(context.applicationContext) // Use application context
+        contextRef = WeakReference(context.applicationContext)
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val cacheDir = context.cacheDir // Access cacheDir on background thread
+                val cacheDir = context.cacheDir
                 fileUrl = File(cacheDir, "ASCrash.dat")
 
-                if (fileUrl!!.exists()) {
-                    val crashData = fileUrl!!.readBytes()
+                val f = fileUrl ?: return@launch
+                if (f.exists()) {
+                    val crashData = f.readBytes()
                     NetworkManager.sendLateMessage(crashData) { success ->
-                        if (success) {
-                            fileUrl!!.delete()
-                        }
+                        if (success) f.delete()
                     }
                 }
             } catch (e: Exception) {
-                DebugUtils.log("Error in Crash.init: ${e.message}")
+                DebugUtils.log("[Crash] Error in init: ${e.message}")
             }
         }
     }
 
     fun start() {
+        if (isActive) return
+        isActive = true
+
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
-            DebugUtils.log("Captured crash: ${e.localizedMessage}")
+            DebugUtils.log("[Crash] Captured crash: ${e.localizedMessage}")
             val message = ORMobileCrash(
                 name = e.javaClass.name,
                 reason = e.localizedMessage ?: "",
-                stacktrace = e.stackTrace.joinToString(separator = "\n") { it.toString() }
+                stacktrace = e.stackTrace.joinToString("\n") { it.toString() }
             )
-            val messageData = message.contentData()
+
+            val crashBytes = message.contentData()
 
             CoroutineScope(Dispatchers.IO).launch {
                 try {
-                    fileUrl?.writeBytes(messageData)
-                    NetworkManager.sendMessage(messageData) { success ->
+                    val file = fileUrl ?: contextRef?.get()?.let {
+                        File(it.cacheDir, "ASCrash.dat")
+                    }
+                    file?.writeBytes(crashBytes)
+
+                    NetworkManager.sendMessage(crashBytes) { success ->
                         if (success) {
-                            deleteFile(fileUrl!!)
+                            file?.delete()
+                        } else {
+                            DebugUtils.log("[Crash] Failed to send crash, saved locally")
                         }
                     }
                 } catch (ex: Exception) {
-                    DebugUtils.log("Error saving or sending crash data: ${ex.message}")
+                    DebugUtils.log("[Crash] Error saving or sending crash: ${ex.message}")
                 }
             }
         }
-        isActive = true
     }
 
     fun sendLateError(exception: Exception) {
         val message = ORMobileCrash(
             name = exception.javaClass.name,
             reason = exception.localizedMessage ?: "",
-            stacktrace = exception.stackTrace.joinToString(separator = "\n") { it.toString() }
+            stacktrace = exception.stackTrace.joinToString("\n") { it.toString() }
         )
+
+        val crashBytes = message.contentData()
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                NetworkManager.sendLateMessage(message.contentData()) { success ->
+                NetworkManager.sendLateMessage(crashBytes) { success ->
                     if (success) {
-                        deleteFile(fileUrl!!)
+                        fileUrl?.delete()
                     }
                 }
             } catch (e: Exception) {
-                DebugUtils.log("Error sending late error: ${e.message}")
+                DebugUtils.log("[Crash] Error sending late error: ${e.message}")
             }
         }
     }
 
     fun stop() {
-        if (isActive) {
-            Thread.setDefaultUncaughtExceptionHandler(null)
-            isActive = false
-        }
-    }
-
-    private fun deleteFile(file: File) {
-        try {
-            if (file.exists()) {
-                file.delete()
-            }
-        } catch (e: Exception) {
-            DebugUtils.log("Error deleting file: ${e.message}")
-        }
+        if (!isActive) return
+        Thread.setDefaultUncaughtExceptionHandler(null)
+        isActive = false
     }
 }

@@ -1,11 +1,10 @@
+package com.openreplay.tracker.managers
+
 import android.content.Context
 import android.net.TrafficStats
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.openreplay.tracker.OpenReplay
-import com.openreplay.tracker.managers.ApiResponse
-import com.openreplay.tracker.managers.DebugUtils
-import com.openreplay.tracker.managers.UserDefaults
 import com.openreplay.tracker.models.SessionResponse
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -26,26 +25,26 @@ object NetworkManager {
     private val networkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     var baseUrl = "https://api.openreplay.com/ingest"
-
     @Volatile
     var sessionId: String? = null
-
     @Volatile
     var projectId: String? = null
+    @Volatile
+    var projectKey: String? = null
 
     @Volatile
-    private var token: String? = null
-
+    var token: String? = null
     private var writeToFile = false
     private lateinit var appContext: Context
 
     fun initialize(context: Context) {
-        appContext = context.applicationContext // Avoid memory leaks
-    }
-
-    fun getAppContext(): Context {
         if (!this::appContext.isInitialized) {
-            throw IllegalStateException("NetworkManager must be initialized with a Context before usage.")
+            appContext = context.applicationContext
+        }
+    }
+    private fun getAppContext(): Context {
+        if (!this::appContext.isInitialized) {
+            throw IllegalStateException("NetworkManager must be initialized with a Context before usage")
         }
         return appContext
     }
@@ -59,36 +58,28 @@ object NetworkManager {
         val url = URL(baseUrl + path)
         val connection = url.openConnection() as HttpURLConnection
 
-        try {
-            // Tag the thread for network usage tracking
-            TrafficStats.setThreadStatsTag(1000)
+        connection.connectTimeout = 10000
+        connection.readTimeout = 30000
 
+        try {
+            TrafficStats.setThreadStatsTag(1000)
             connection.requestMethod = method
             connection.doInput = true
             connection.useCaches = false
+            headers?.forEach { (k, v) -> connection.setRequestProperty(k, v) }
 
-            // Add headers to the connection
-            headers?.forEach { (key, value) -> connection.setRequestProperty(key, value) }
-
-            // Add body if it's a POST/PUT request
             if (body != null) {
                 connection.doOutput = true
-                connection.outputStream.use { outputStream ->
-                    outputStream.write(body)
-                }
+                connection.outputStream.use { it.write(body) }
             }
         } catch (e: Exception) {
-            connection.disconnect() // Disconnect in case of failure
+            connection.disconnect()
             throw e
         } finally {
-            // Clear the thread's TrafficStats tag
             TrafficStats.clearThreadStatsTag()
         }
-
         return@withContext connection
     }
-
-
     fun createSession(params: Map<String, Any>, completion: (SessionResponse?) -> Unit) {
         networkScope.launch {
             if (writeToFile) {
@@ -98,7 +89,6 @@ object NetworkManager {
             }
 
             val json = Gson().toJson(params).toByteArray()
-
             try {
                 val request = createRequest(
                     "POST",
@@ -107,28 +97,24 @@ object NetworkManager {
                     headers = mapOf("Content-Type" to "application/json; charset=utf-8")
                 )
 
-                val body = request.inputStream.use { inputStream ->
-                    inputStream.bufferedReader().readText()
-                }
-
+                val body = request.inputStream.bufferedReader().readText()
                 if (body.isNotEmpty()) {
                     val sessionResponse = Gson().fromJson(body, SessionResponse::class.java)
                     token = sessionResponse.token
                     sessionId = sessionResponse.sessionID
                     projectId = sessionResponse.projectID
-
+                    projectKey = params["projectKey"] as? String
                     withContext(Dispatchers.Main) { completion(sessionResponse) }
                 } else {
-                    DebugUtils.log("Empty response body for createSession")
+                    DebugUtils.log("[Network] Empty body for /start")
                     withContext(Dispatchers.Main) { completion(null) }
                 }
             } catch (e: Exception) {
-                DebugUtils.log("Error in createSession: ${e.message}")
+                DebugUtils.log("[Network] createSession error: ${e.message}")
                 withContext(Dispatchers.Main) { completion(null) }
             }
         }
     }
-
     fun sendMessage(content: ByteArray, completion: (Boolean) -> Unit) {
         networkScope.launch {
             if (writeToFile) {
@@ -136,19 +122,17 @@ object NetworkManager {
                 return@launch
             }
 
-            val compressedContent = try {
-                compressData(content).also {
-                    DebugUtils.log("Compressed ${content.size} bytes to ${it.size} bytes")
+            val compressed = runCatching { compressData(content) }
+                .onSuccess { DebugUtils.log("[Network] Compressed ${content.size}B -> ${it.size}B") }
+                .getOrElse {
+                    DebugUtils.log("[Network] Compression failed: ${it.message}")
+                    content
                 }
-            } catch (e: Exception) {
-                DebugUtils.log("Error with compression: ${e.message}")
-                content
-            }
 
             val request = createRequest(
                 "POST",
                 INGEST_URL,
-                body = compressedContent,
+                body = compressed,
                 headers = mapOf(
                     "Authorization" to "Bearer $token",
                     "Content-Encoding" to "gzip",
@@ -158,185 +142,162 @@ object NetworkManager {
 
             try {
                 request.connect()
-                if (request.responseCode in 200..299) {
-                    DebugUtils.log("Message sent successfully")
-                    withContext(Dispatchers.Main) { completion(true) }
-                } else {
-                    DebugUtils.log("Failed to send message: ${request.responseCode}")
-                    withContext(Dispatchers.Main) { completion(false) }
+                when (request.responseCode) {
+                    in 200..299 -> {
+                        DebugUtils.log("[Network] Message sent OK")
+                        withContext(Dispatchers.Main) { completion(true) }
+                    }
+                    401 -> {
+                        DebugUtils.log("[Network] 401 unauthorized – token expired")
+                        OpenReplay.stopRecording(closeSession = true)
+                        withContext(Dispatchers.Main) { completion(false) }
+                    }
+                    else -> {
+                        DebugUtils.log("[Network] sendMessage failed: ${request.responseCode}")
+                        withContext(Dispatchers.Main) { completion(false) }
+                    }
                 }
             } catch (e: Exception) {
-                DebugUtils.log("Message sending failed: ${e.message}")
+                DebugUtils.log("[Network] sendMessage exception: ${e.message}")
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request.disconnect()
             }
         }
     }
-
     fun getConditions(completion: (List<ApiResponse>) -> Unit) {
         networkScope.launch {
-            val token = this@NetworkManager.token ?: run {
-                DebugUtils.log("No token available for getConditions.")
+            val tok = token ?: run {
+                DebugUtils.log("[Network] No token for getConditions")
                 withContext(Dispatchers.Main) { completion(emptyList()) }
                 return@launch
             }
 
             val request = createRequest(
-                method = "GET",
-                path = "$CONDITIONS/$projectId",
-                headers = mapOf("Authorization" to "Bearer $token")
+                "GET",
+                "$CONDITIONS/$projectId",
+                headers = mapOf("Authorization" to "Bearer $tok")
             )
 
             try {
                 request.connect()
-                val responseBody = request.inputStream.use { inputStream ->
-                    inputStream.bufferedReader().readText()
-                }
-                val gson = Gson()
+                val json = request.inputStream.bufferedReader().readText()
                 val type = object : TypeToken<Map<String, List<ApiResponse>>>() {}.type
-                val jsonResponse = gson.fromJson<Map<String, List<ApiResponse>>>(responseBody, type)
-                val conditions = jsonResponse["conditions"] ?: emptyList()
+                val parsed = Gson().fromJson<Map<String, List<ApiResponse>>>(json, type)
+                val conditions = parsed["conditions"] ?: emptyList()
                 withContext(Dispatchers.Main) { completion(conditions) }
             } catch (e: Exception) {
-                DebugUtils.error("Conditions JSON parsing error: $e")
+                DebugUtils.error("[Network] getConditions parse error: $e")
                 withContext(Dispatchers.Main) { completion(emptyList()) }
             } finally {
                 request.disconnect()
             }
         }
     }
-
     private fun compressData(data: ByteArray): ByteArray {
-        val byteArrayOutputStream = ByteArrayOutputStream()
-        GZIPOutputStream(byteArrayOutputStream).use { gzipOutputStream ->
-            gzipOutputStream.write(data)
-        }
-        return byteArrayOutputStream.toByteArray()
+        val out = ByteArrayOutputStream()
+        GZIPOutputStream(out).use { it.write(data) }
+        return out.toByteArray()
     }
-
     private fun appendLocalFile(data: ByteArray) {
         networkScope.launch {
             if (OpenReplay.options.debugLogs) {
-                val filePath = File(getAppContext().filesDir, "session.dat")
+                val file = File(getAppContext().filesDir, "session.dat")
                 try {
-                    filePath.apply {
-                        parentFile?.mkdirs()
-                        createNewFile()
-                    }.outputStream().apply {
-                        FileOutputStream(filePath, true).use { it.write(data) }
-                    }
-                    DebugUtils.log("Data appended to file at: ${filePath.absolutePath}")
+                    file.parentFile?.mkdirs()
+                    file.createNewFile()
+                    FileOutputStream(file, true).use { it.write(data) }
+                    DebugUtils.log("[Network] Data appended to ${file.absolutePath}")
                 } catch (e: IOException) {
-                    DebugUtils.log("File append error: ${e.message}")
+                    DebugUtils.log("[Network] File append error: ${e.message}")
                 }
             }
         }
     }
-
     fun sendLateMessage(content: ByteArray, completion: (Boolean) -> Unit) {
         networkScope.launch {
-            val token = UserDefaults.lastToken ?: run {
-                DebugUtils.log("No last token found for sendLateMessage.")
+            val tok = UserDefaults.lastToken ?: run {
+                DebugUtils.log("[Network] No last token for sendLateMessage")
                 withContext(Dispatchers.Main) { completion(false) }
                 return@launch
             }
 
             val request = createRequest(
-                method = "POST",
-                path = LATE_URL,
+                "POST",
+                LATE_URL,
                 body = content,
-                headers = mapOf("Authorization" to "Bearer $token")
+                headers = mapOf("Authorization" to "Bearer $tok")
             )
 
             try {
                 request.connect()
-                if (request.responseCode in 200..299) {
-                    DebugUtils.log("Late message sent successfully")
-                    withContext(Dispatchers.Main) { completion(true) }
-                } else {
-                    DebugUtils.log("Failed to send late message: ${request.responseCode}")
-                    withContext(Dispatchers.Main) { completion(false) }
-                }
+                val ok = request.responseCode in 200..299
+                DebugUtils.log("[Network] sendLateMessage -> $ok (${request.responseCode})")
+                withContext(Dispatchers.Main) { completion(ok) }
             } catch (e: Exception) {
-                DebugUtils.log("Error sending late message: ${e.message}")
+                DebugUtils.log("[Network] sendLateMessage exception: ${e.message}")
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request.disconnect()
             }
         }
     }
-
     private fun buildMultipartBody(
         boundary: String,
         formFields: Map<String, String>,
         fileField: Pair<String, Pair<String, ByteArray>>
     ): ByteArray {
-        val outputStream = ByteArrayOutputStream()
-        val writer = outputStream.bufferedWriter()
+        val out = ByteArrayOutputStream()
+        val writer = out.bufferedWriter()
 
-        // Write form fields
-        formFields.forEach { (name, value) ->
+        formFields.forEach { (n, v) ->
             writer.write("--$boundary\r\n")
-            writer.write("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
-            writer.write("$value\r\n")
+            writer.write("Content-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n")
         }
 
-        // Write file field
         val (fileName, fileData) = fileField.second
         writer.write("--$boundary\r\n")
         writer.write("Content-Disposition: form-data; name=\"${fileField.first}\"; filename=\"$fileName\"\r\n")
         writer.write("Content-Type: application/gzip\r\n\r\n")
         writer.flush()
-        outputStream.write(fileData)
-        writer.write("\r\n")
-        writer.write("--$boundary--\r\n")
+        out.write(fileData)
+        writer.write("\r\n--$boundary--\r\n")
         writer.flush()
-
-        return outputStream.toByteArray()
+        return out.toByteArray()
     }
 
-    fun sendImages(
-        projectKey: String,
-        images: ByteArray,
-        name: String,
-        completion: (Boolean) -> Unit
-    ) {
+    fun sendImages(projectKey: String, images: ByteArray, name: String, completion: (Boolean) -> Unit) {
         networkScope.launch {
-            val token = this@NetworkManager.token ?: run {
-                DebugUtils.log("No token available for sendImages.")
+            val tok = token ?: run {
+                DebugUtils.log("[Network] No token for sendImages")
                 withContext(Dispatchers.Main) { completion(false) }
                 return@launch
             }
 
             val boundary = "Boundary-${UUID.randomUUID()}"
-            val requestBody = buildMultipartBody(
+            val body = buildMultipartBody(
                 boundary,
                 formFields = mapOf("projectKey" to projectKey),
                 fileField = "batch" to Pair(name, images)
             )
 
             val request = createRequest(
-                method = "POST",
-                path = IMAGES_URL,
-                body = requestBody,
+                "POST",
+                IMAGES_URL,
+                body = body,
                 headers = mapOf(
-                    "Authorization" to "Bearer $token",
+                    "Authorization" to "Bearer $tok",
                     "Content-Type" to "multipart/form-data; boundary=$boundary"
                 )
             )
 
             try {
                 request.connect()
-                if (request.responseCode in 200..299) {
-                    DebugUtils.log("Images sent successfully")
-                    withContext(Dispatchers.Main) { completion(true) }
-                } else {
-                    DebugUtils.log("Failed to send images: ${request.responseCode}")
-                    withContext(Dispatchers.Main) { completion(false) }
-                }
+                val ok = request.responseCode in 200..299
+                DebugUtils.log("[Network] sendImages -> $ok (${request.responseCode})")
+                withContext(Dispatchers.Main) { completion(ok) }
             } catch (e: Exception) {
-                DebugUtils.log("Error sending images: ${e.message}")
+                DebugUtils.log("[Network] sendImages exception: ${e.message}")
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request.disconnect()

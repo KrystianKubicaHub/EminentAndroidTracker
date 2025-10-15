@@ -4,12 +4,12 @@ import com.openreplay.tracker.OpenReplay
 
 object DebugUtils {
     fun error(str: String) {
-        println("OpenReplay Error: $str")
+        println("x Error: $str")
     }
 
     fun log(str: String) {
         if (OpenReplay.options.debugLogs) {
-            println(str)
+            println("OpenReplay: $str")
         }
     }
 

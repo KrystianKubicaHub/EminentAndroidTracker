@@ -1,27 +1,29 @@
 package com.openreplay.tracker.models
 
 import android.content.Context
-import android.os.*
+import android.os.Build
 import android.util.DisplayMetrics
 import android.view.WindowManager
 import com.openreplay.tracker.OpenReplay
-import java.util.Date
-import java.io.Serializable
 import com.openreplay.tracker.managers.DebugUtils
+import com.openreplay.tracker.managers.NetworkManager
 import com.openreplay.tracker.managers.UserDefaults
-import kotlin.math.abs
+import kotlinx.coroutines.*
+import java.io.Serializable
+import java.util.*
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 
 object SessionRequest {
     private val params = mutableMapOf<String, Any>()
     private val sessionId = AtomicReference<String?>()
     private val cachedSessionResponse = AtomicReference<SessionResponse?>()
-    private const val RETRY_DELAY_MS = 5000
+
+    private const val RETRY_DELAY_MS = 5000L
     private const val MAX_RETRIES = 5
     private var retryCount = 0
 
     fun create(context: Context, doNotRecord: Boolean, completion: (SessionResponse?) -> Unit) {
-        // Return cached session if already present
         cachedSessionResponse.get()?.let {
             completion(it)
             return
@@ -37,15 +39,15 @@ object SessionRequest {
     }
 
     private fun initializeParams(context: Context, doNotRecord: Boolean) {
-        val resolution = getDeviceResolution(context)
+        val (width, height) = getDeviceResolution(context)
         val deviceModel = Build.DEVICE ?: "Unknown"
         val deviceType = if (isTablet(context)) "tablet" else "mobile"
 
         params.apply {
             clear()
             put("platform", "android")
-            put("width", resolution.first)
-            put("height", resolution.second)
+            put("width", width)
+            put("height", height)
             put("doNotRecord", doNotRecord)
             put("projectKey", OpenReplay.projectKey!!)
             put("trackerVersion", OpenReplay.options.pkgVersion)
@@ -55,20 +57,27 @@ object SessionRequest {
             put("userDevice", deviceModel)
             put("userDeviceType", deviceType)
             put("timestamp", Date().time)
-            put("deviceMemory", Runtime.getRuntime().maxMemory() / 1024)
+            put("deviceMemory", Runtime.getRuntime().maxMemory() / (1024 * 1024)) // MB
             put("timezone", getTimezone())
         }
     }
 
     private fun getDeviceResolution(context: Context): Pair<Int, Int> {
-        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = windowManager.currentWindowMetrics.bounds
-            Pair(bounds.width(), bounds.height())
+            try {
+                val bounds = wm.currentWindowMetrics.bounds
+                Pair(bounds.width(), bounds.height())
+            } catch (e: Exception) {
+                val metrics = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                wm.defaultDisplay.getMetrics(metrics)
+                Pair(metrics.widthPixels, metrics.heightPixels)
+            }
         } else {
             val metrics = DisplayMetrics()
             @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getMetrics(metrics)
+            wm.defaultDisplay.getMetrics(metrics)
             Pair(metrics.widthPixels, metrics.heightPixels)
         }
     }
@@ -85,18 +94,21 @@ object SessionRequest {
                 sessionResponse != null -> {
                     sessionId.set(sessionResponse.sessionID)
                     cachedSessionResponse.set(sessionResponse)
-                    retryCount = 0 // Reset retry count
-                    DebugUtils.log(">>>> Starting session : ${sessionResponse.sessionID}")
+                    retryCount = 0
+                    DebugUtils.log("[SessionRequest] Started session: ${sessionResponse.sessionID}")
                     completion(sessionResponse)
                 }
+
                 retryCount < MAX_RETRIES -> {
                     retryCount++
-                    Handler(Looper.getMainLooper()).postDelayed({
+                    CoroutineScope(Dispatchers.IO).launch {
+                        delay(RETRY_DELAY_MS)
                         callAPI(completion)
-                    }, RETRY_DELAY_MS.toLong())
+                    }
                 }
+
                 else -> {
-                    DebugUtils.log(">>>> Failed to start session after $MAX_RETRIES retries")
+                    DebugUtils.log("[SessionRequest] Failed after $MAX_RETRIES retries.")
                     completion(null)
                 }
             }
@@ -117,7 +129,7 @@ data class SessionResponse(
 ) : Serializable
 
 fun getTimezone(): String {
-    val offset = java.util.TimeZone.getDefault().getOffset(Date().time) / 1000
+    val offset = TimeZone.getDefault().getOffset(Date().time) / 1000
     val sign = if (offset >= 0) "+" else "-"
     val hours = abs(offset) / 3600
     val minutes = (abs(offset) % 3600) / 60

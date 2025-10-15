@@ -1,39 +1,28 @@
 package com.openreplay.tracker
 
-import NetworkManager
+import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.BroadcastReceiver
+import android.app.Application
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.widget.FrameLayout
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.wrapContentHeight
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.AbstractComposeView
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.viewinterop.AndroidView
 import com.google.gson.Gson
-import com.openreplay.tracker.listeners.Analytics
 import com.openreplay.tracker.listeners.Crash
 import com.openreplay.tracker.listeners.LifecycleManager
 import com.openreplay.tracker.listeners.LogsListener
-import com.openreplay.tracker.listeners.ORGestureListener
 import com.openreplay.tracker.listeners.PerformanceListener
 import com.openreplay.tracker.listeners.sendNetworkMessage
-import com.openreplay.tracker.managers.ConditionsManager
 import com.openreplay.tracker.managers.DebugUtils
 import com.openreplay.tracker.managers.MessageCollector
 import com.openreplay.tracker.managers.MessageHandler
+import com.openreplay.tracker.managers.NetworkManager
 import com.openreplay.tracker.managers.ScreenshotManager
 import com.openreplay.tracker.managers.UserDefaults
 import com.openreplay.tracker.models.OROptions
@@ -44,240 +33,228 @@ import com.openreplay.tracker.models.script.ORMobileMetadata
 import com.openreplay.tracker.models.script.ORMobileUserID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Date
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
 
-enum class CheckState {
-    UNCHECKED, CAN_START, CANT_START
-}
+private enum class RecorderState { IDLE, INITIALIZED, RECORDING, STOPPING }
 
+@SuppressLint("StaticFieldLeak")
 object OpenReplay {
     var projectKey: String? = null
-    var sessionStartTs: Long = 0
-    var bufferingMode = false
+        private set
+
     var options: OROptions = OROptions.defaults
-    private var lifecycleManager: LifecycleManager? = null
-    private var lateMessagesFile: File? = null
+        private set
 
     var serverURL: String
         get() = NetworkManager.baseUrl
-        set(value) {
-            NetworkManager.baseUrl = value
-        }
-
+        set(value) { NetworkManager.baseUrl = value }
+    private var app: Application? = null
     private var appContext: Context? = null
+    private var lifecycleManager: LifecycleManager? = null
+    private var networkCallbackRegistered = false
+    private var connectivityManager: ConnectivityManager? = null
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val mainScope = MainScope()
+
+    private var state: RecorderState = RecorderState.IDLE
+    private val isInitialized = AtomicBoolean(false)
+    private val autoRecordingEnabled = AtomicBoolean(false)
+
+    private var sessionStartTs: Long = 0L
+    private var lateMessagesFile: File? = null
+    @Volatile private var currentActivity: Activity? = null
     private var gestureDetector: GestureDetector? = null
 
+    private val startedActivities = AtomicInteger(0)
+    private var lastBecameBackgroundAt: Long = 0L
 
-    fun start(context: Context, projectKey: String, options: OROptions, onStarted: () -> Unit) {
-        NetworkManager.initialize(context)
-        CoroutineScope(Dispatchers.IO).launch {
-            UserDefaults.init(context)
-        }
-        this.appContext = context // Use application context to avoid leaks
-        this.options = this.options.merge(options)
-        this.projectKey = projectKey
+    fun initialize(context: Context, projectKey: String, options: OROptions = OROptions.defaults) {
+        val application = (context.applicationContext as? Application)
+            ?: throw IllegalArgumentException("OpenReplay.initialize requires Application context")
 
-        val connectivityManager =
-            context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val networkCallback = object : ConnectivityManager.NetworkCallback() {
-                override fun onCapabilitiesChanged(
-                    network: android.net.Network,
-                    capabilities: NetworkCapabilities
-                ) {
-                    super.onCapabilitiesChanged(network, capabilities)
-                    handleNetworkChange(capabilities, onStarted)
-                }
-            }
-
-            connectivityManager.registerDefaultNetworkCallback(networkCallback)
-        } else {
-            // For API levels below 24, listen for connectivity changes using BroadcastReceiver
-            val intentFilter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
-            context.registerReceiver(object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    val activeNetworkInfo = connectivityManager.activeNetworkInfo
-                    if (activeNetworkInfo != null && activeNetworkInfo.isConnected) {
-                        // Call your method to handle connectivity change
-                        startSession(onStarted)
-                    }
-                }
-            }, intentFilter)
-        }
-        checkForLateMessages()
-    }
-
-    private fun handleNetworkChange(capabilities: NetworkCapabilities, onStarted: () -> Unit) {
-        when {
-            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && !options.wifiOnly -> {
-                startSession(onStarted)
-            }
-        }
-    }
-
-    fun startSession(onStarted: () -> Unit) {
-        sessionStartTs = Date().time
-        setupGestureDetector(appContext!!)
-        SessionRequest.create(appContext!!, false) { sessionResponse ->
-            sessionResponse ?: return@create println("Openreplay: no response from /start request")
-
-            if (this.lifecycleManager == null) {
-                this.lifecycleManager = LifecycleManager(appContext!!)
-            }
-            MessageCollector.start(appContext!!)
-
-            with(options) {
-                if (screen) {
-                    ScreenshotManager.setSettings(
-                        settings = getCaptureSettings(
-                            fps = 1,
-                            quality = options.screenshotQuality
-                        )
-                    )
-                    ScreenshotManager.start(appContext!!, sessionStartTs)
-                }
-                if (logs) LogsListener.start()
-                if (crashes) {
-                    Crash.init(appContext!!)
-                    Crash.start()
-                }
-                if (performances) PerformanceListener.getInstance(appContext!!).start()
-                if (analytics) Analytics.start()
-            }
-            onStarted()
-        }
-    }
-
-    fun getLateMessagesFile(context: Context): File {
-        if (lateMessagesFile == null) {
-            lateMessagesFile = File(context.cacheDir, "lateMessages.dat")
-        }
-        return lateMessagesFile!!
-    }
-
-    fun coldStart(context: Context, projectKey: String, options: OROptions, onStarted: () -> Unit) {
-        NetworkManager.initialize(context)
-        this.appContext = context // Use application context to avoid leaks
-        this.options = options
-        this.projectKey = projectKey
-        this.bufferingMode = true
-
-        CoroutineScope(Dispatchers.IO).launch {
-            UserDefaults.init(context)
-        }
-
-        SessionRequest.create(appContext!!, false) { sessionResponse ->
-            sessionResponse ?: return@create println("Openreplay: no response from /start request")
-            ConditionsManager.getConditions()
-            MessageCollector.cycleBuffer()
-            onStarted()
-
-            with(this.options) {
-                if (screen) {
-                    ScreenshotManager.setSettings(
-                        settings = getCaptureSettings(
-                            fps = 1,
-                            quality = OpenReplay.options.screenshotQuality
-                        )
-                    )
-                    ScreenshotManager.start(appContext!!, sessionStartTs)
-                }
-                if (logs) LogsListener.start()
-                if (crashes) {
-                    Crash.init(appContext!!)
-                    Crash.start()
-                }
-                if (performances) PerformanceListener.getInstance(appContext!!).start()
-                if (analytics) Analytics.start()
-            }
-        }
-    }
-
-    fun triggerRecording(condition: String?) {
-        this.bufferingMode = false
-        if (options.debugLogs) {
-            DebugUtils.log("Triggering recording with condition: $condition")
-        }
-        SessionRequest.create(context = appContext!!, doNotRecord = false) { sessionResponse ->
-            sessionResponse?.let {
-                MessageCollector.syncBuffers()
-                MessageCollector.start(appContext!!)
-            } ?: run {
-                println("Openreplay: no response from /start request")
-            }
-        }
-    }
-
-    private fun checkForLateMessages() {
-        val context = appContext ?: run {
-            DebugUtils.log("appContext is null. Cannot check for late messages.")
+        if (isInitialized.getAndSet(true)) {
+            this.options = this.options.merge(options)
             return
         }
 
-        CoroutineScope(Dispatchers.IO).launch {
-            val lateMessagesFile = File(context.filesDir, "lateMessages.dat")
-            if (lateMessagesFile.exists()) {
-                try {
-                    val crashData = lateMessagesFile.readBytes()
-                    NetworkManager.sendLateMessage(crashData) { success ->
-                        if (success) {
-                            CoroutineScope(Dispatchers.IO).launch {
-                                lateMessagesFile.delete()
-                            }
-                        }
+        this.app = application
+        this.appContext = application.applicationContext
+        this.projectKey = projectKey
+        this.options = options
+
+        NetworkManager.initialize(application)
+        CoroutineScope(Dispatchers.IO).launch { UserDefaults.init(application) }
+
+        lifecycleManager = LifecycleManager(application) { event, activity ->
+            when (event) {
+                LifecycleManager.Event.ActivityStarted -> {
+                    startedActivities.incrementAndGet()
+                    updateCurrentActivity(activity)
+                    onAppForeground()
+                }
+                LifecycleManager.Event.ActivityResumed -> {
+                    updateCurrentActivity(activity)
+                }
+                LifecycleManager.Event.ActivityPaused -> {
+                }
+                LifecycleManager.Event.ActivityStopped -> {
+                    val left = startedActivities.decrementAndGet().coerceAtLeast(0)
+                    if (left == 0) {
+                        lastBecameBackgroundAt = System.currentTimeMillis()
+                        onAppBackground()
                     }
-                } catch (e: Exception) {
-                    DebugUtils.log("Error processing late messages: ${e.message}")
                 }
             }
+        }.also {
+            application.registerActivityLifecycleCallbacks(it)
+        }
+        registerNetworkCallbacks(application)
+
+        checkForLateMessages()
+        state = RecorderState.INITIALIZED
+    }
+    fun getSessionStartTimestamp(): Long = sessionStartTs
+
+    fun triggerRecordingByCondition(reason: String) {
+        DebugUtils.log("[OpenReplay] Triggered recording by condition: $reason")
+        startRecording()
+    }
+
+
+
+    fun enableAutoRecording(enable: Boolean) {
+        autoRecordingEnabled.set(enable)
+        if (enable && startedActivities.get() > 0 && state == RecorderState.INITIALIZED) {
+            startRecording()
+        }
+        if (!enable && state == RecorderState.RECORDING) {
         }
     }
 
-    fun stop(closeSession: Boolean = true) {
+    fun startRecording(optionsOverride: OROptions? = null, onStarted: (() -> Unit)? = null) {
+        if (!isInitialized.get()) {
+            DebugUtils.log("OpenReplay not initialized; call initialize() first")
+            return
+        }
+        if (state == RecorderState.RECORDING) {
+            onStarted?.invoke()
+            return
+        }
+        if (state == RecorderState.STOPPING) return
+
+        optionsOverride?.let { this.options = this.options.merge(it) }
+
+        state = RecorderState.RECORDING
+        sessionStartTs = Date().time
+
+        SessionRequest.create(appContext!!, doNotRecord = false) { sessionResponse ->
+            if (sessionResponse == null) {
+                DebugUtils.log("OpenReplay: no response from /start")
+                state = RecorderState.INITIALIZED
+                return@create
+            }
+            MessageCollector.start(appContext!!)
+            if (options.screen) {
+                ScreenshotManager.setSettings(getCaptureSettings( fps = options.fps, quality = options.screenshotQuality))
+                ScreenshotManager.updateCurrentActivity(currentActivity)
+                ScreenshotManager.start(appContext!!, sessionStartTs, options)
+            }
+            if (options.logs) LogsListener.start()
+            if (options.crashes) {
+                Crash.init(appContext!!)
+                Crash.start()
+            }
+            if (options.performances) PerformanceListener.getInstance(appContext!!).start()
+
+            onStarted?.invoke()
+        }
+    }
+
+    fun stopRecording(closeSession: Boolean = true) {
+        if (!isInitialized.get()) return
+        if (state != RecorderState.RECORDING) return
+
+        state = RecorderState.STOPPING
+
         ScreenshotManager.stop()
-        Analytics.stop()
         LogsListener.stop()
         PerformanceListener.getInstance(appContext!!).stop()
         Crash.stop()
         MessageCollector.stop()
-        if (closeSession) {
-            SessionRequest.clear()
+        if (closeSession) SessionRequest.clear()
+
+        state = RecorderState.INITIALIZED
+    }
+
+    fun shutdown() {
+        stopRecording(closeSession = true)
+
+        lifecycleManager?.let {
+            app?.unregisterActivityLifecycleCallbacks(it)
+        }
+        lifecycleManager = null
+
+        unregisterNetworkCallbacks()
+
+        isInitialized.set(false)
+        state = RecorderState.IDLE
+    }
+
+    fun updateCurrentActivity(activity: Activity?) {
+        currentActivity = activity
+        ScreenshotManager.updateCurrentActivity(activity)
+    }
+    internal fun onAppForeground() {
+        if (autoRecordingEnabled.get() && state == RecorderState.INITIALIZED) {
+            startRecording()
         }
     }
 
+    internal fun onAppBackground() {
+        if (autoRecordingEnabled.get()) {
+            scope.launch {
+                delay(800)
+                if (startedActivities.get() == 0 && state == RecorderState.RECORDING) {
+                    stopRecording(closeSession = false)
+                }
+            }
+        }
+    }
+
+    fun isRecording(): Boolean = state == RecorderState.RECORDING
+
     fun setUserID(userID: String) {
-        val message = ORMobileUserID(iD = userID)
-        MessageCollector.sendMessage(message)
+        MessageCollector.sendMessage(ORMobileUserID(iD = userID))
     }
 
     fun setMetadata(key: String, value: String) {
-        val message = ORMobileMetadata(key = key, value = value)
-        MessageCollector.sendMessage(message)
+        MessageCollector.sendMessage(ORMobileMetadata(key = key, value = value))
     }
 
     fun userAnonymousID(iD: String) {
-        val message = ORMobileUserID(iD = iD)
-        MessageCollector.sendMessage(message)
+        MessageCollector.sendMessage(ORMobileUserID(iD = iD))
     }
 
-    fun addIgnoredView(view: View) {
-        ScreenshotManager.addSanitizedElement(view)
+    fun addIgnoredView(view: View) = ScreenshotManager.addSanitizedElement(view)
+    fun sanitizeView(view: View) = ScreenshotManager.addSanitizedElement(view)
+
+    fun event(name: String, obj: Any?) {
+        val json = obj?.let { Gson().toJson(it) } ?: ""
+        eventStr(name, json)
     }
 
-    fun sanitizeView(view: View) {
-        ScreenshotManager.addSanitizedElement(view)
-    }
-
-    fun event(name: String, `object`: Any?) {
-        val gson = Gson()
-        val jsonPayload = `object`?.let { gson.toJson(it) } ?: ""
-        eventStr(name, jsonPayload)
+    fun eventStr(name: String, jsonPayload: String) {
+        MessageCollector.sendMessage(ORMobileEvent(name, payload = jsonPayload))
     }
 
     fun networkRequest(
@@ -287,98 +264,82 @@ object OpenReplay {
         responseJSON: String,
         status: Int,
         duration: ULong
-    ) {
-        sendNetworkMessage(url, method, requestJSON, responseJSON, status, duration)
+    ) = sendNetworkMessage(url, method, requestJSON, responseJSON, status, duration)
+
+    fun sendMessage(type: String, msg: Any) = MessageHandler.sendMessage(type, msg)
+
+    fun getSessionID(): String = SessionRequest.getSessionId() ?: ""
+
+
+    fun onTouchEvent(event: MotionEvent) {
+        gestureDetector?.onTouchEvent(event)
     }
 
-    fun sendMessage(type: String, msg: Any) {
-        MessageHandler.sendMessage(type, msg)
-    }
-
-    fun eventStr(name: String, jsonPayload: String) {
-        val message = ORMobileEvent(name, payload = jsonPayload)
-        MessageCollector.sendMessage(message)
-    }
-
-//    fun setupGestureDetector(context: Context) {
-//        val rootView = (context as Activity).window.decorView.rootView
-//        val gestureListener = ORGestureListener(rootView)
-//        this.gestureDetector = GestureDetector(context, gestureListener)
-//    }
-
-//    @Composable
-//    fun GestureDetectorBox(onGestureDetected: () -> Unit) {
-//        val context = LocalContext.current
-//        setupGestureDetector(context) {
-//            onGestureDetected()
-//        }
-//
-//        Box(
-//            modifier = Modifier
-//                .fillMaxSize()
-//                .pointerInput(Unit) {
-//                    detectTapGestures(
-//                        onTap = {
-//                            onGestureDetected()
-//                        }
-//                    )
-//                }
-//        ) {
-//            Text(text = "Tap me")
-//        }
-//    }
-
-    fun setupGestureDetector(context: Context) {
-        val activity = context as Activity
-        val rootView = activity.window.decorView.rootView
-
-        val gestureListener = ORGestureListener(rootView)
-        val gestureDetector = GestureDetector(context, gestureListener)
-
-        // Set up gesture detection for legacy Android views
-        rootView.setOnTouchListener { v, event ->
-            gestureDetector.onTouchEvent(event)
+    private fun getLateMessagesFile(context: Context): File {
+        if (lateMessagesFile == null) {
+            lateMessagesFile = File(context.filesDir, "lateMessages.dat")
         }
+        return lateMessagesFile!!
+    }
 
-        // Handle Jetpack Compose views
-        if (rootView is ViewGroup) {
-            println("jetpack view listener")
-            for (i in 0 until rootView.childCount) {
-                val child = rootView.getChildAt(i)
-                if (child is AbstractComposeView) {
-                    println("child listener")
-                    child.setOnTouchListener { v, event ->
-                        gestureDetector.onTouchEvent(event)
-                    }
+    private fun checkForLateMessages() {
+        val context = appContext ?: return
+        CoroutineScope(Dispatchers.IO).launch {
+            val file = getLateMessagesFile(context)
+            if (!file.exists()) return@launch
+            runCatching {
+                val crashData = file.readBytes()
+                NetworkManager.sendLateMessage(crashData) { success ->
+                    if (success) CoroutineScope(Dispatchers.IO).launch { file.delete() }
                 }
+            }.onFailure {
+                DebugUtils.log("Error processing late messages: ${it.message}")
             }
         }
     }
+    private fun registerNetworkCallbacks(application: Application) {
+        if (networkCallbackRegistered) return
+        val cm = application.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        connectivityManager = cm
 
-    fun onTouchEvent(event: MotionEvent) {
-        this.gestureDetector?.onTouchEvent(event)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    if (state != RecorderState.RECORDING) return
+                    val ok = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                            (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && !options.wifiOnly)
+                    if (!ok) {
+                        stopRecording(closeSession = false)
+                    }
+                }
+            })
+            networkCallbackRegistered = true
+        }
     }
 
-    fun getSessionID(): String {
-        return SessionRequest.getSessionId() ?: ""
+    private fun unregisterNetworkCallbacks() {
+        if (!networkCallbackRegistered) return
+        runCatching {
+            connectivityManager?.unregisterNetworkCallback(ConnectivityManager.NetworkCallback())
+        }
+        networkCallbackRegistered = false
     }
 }
 
 fun getCaptureSettings(fps: Int, quality: RecordingQuality): Triple<Int, Int, Int> {
-    val limitedFPS = min(max(fps, 1), 99)
-    val captureRate = 1000 / limitedFPS // Milliseconds per frame
+    val limitedFPS = min(max(fps, 1), 60)
+    val captureRate = (1000 / limitedFPS).coerceAtLeast(250)
 
     val imgCompression = when (quality) {
-        RecordingQuality.Low -> 5
+        RecordingQuality.Low -> 1
         RecordingQuality.Standard -> 30
         RecordingQuality.High -> 60
     }
     val imgResolution = when (quality) {
-        RecordingQuality.Low -> 240
+        RecordingQuality.Low -> 144
         RecordingQuality.Standard -> 720
         RecordingQuality.High -> 1080
     }
-
     return Triple(captureRate, imgCompression, imgResolution)
 }
 
@@ -386,61 +347,18 @@ class SanitizableViewGroup(context: Context) : ViewGroup(context) {
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         var maxHeight = 0
         var maxWidth = 0
-
         for (i in 0 until childCount) {
             val child = getChildAt(i)
             measureChild(child, widthMeasureSpec, heightMeasureSpec)
             maxWidth = maxOf(maxWidth, child.measuredWidth)
             maxHeight = maxOf(maxHeight, child.measuredHeight)
         }
-
-        val width = resolveSize(maxWidth, widthMeasureSpec)
-        val height = resolveSize(maxHeight, heightMeasureSpec)
-        setMeasuredDimension(width, height)
+        setMeasuredDimension(resolveSize(maxWidth, widthMeasureSpec), resolveSize(maxHeight, heightMeasureSpec))
     }
-
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
         for (i in 0 until childCount) {
             val child = getChildAt(i)
             child.layout(0, 0, child.measuredWidth, child.measuredHeight)
         }
     }
-}
-
-
-@Composable
-fun Sanitized(
-    content: @Composable () -> Unit
-) {
-    val context = LocalContext.current
-    AndroidView(
-        factory = {
-            SanitizableViewGroup(context).apply {
-                // Add a FrameLayout to hold the composable content
-                val frameLayout = FrameLayout(context)
-                addView(frameLayout)
-
-                // Set LayoutParams for the frame layout
-                frameLayout.layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            }
-        },
-        modifier = Modifier
-            .fillMaxWidth()
-            .wrapContentHeight(),
-        update = { viewGroup ->
-            // Update the content inside the frame layout
-            val frameLayout = viewGroup.getChildAt(0) as FrameLayout
-            frameLayout.removeAllViews()
-
-            ComposeView(context).apply {
-                setContent {
-                    content()
-                }
-                frameLayout.addView(this)
-            }
-        }
-    )
 }
