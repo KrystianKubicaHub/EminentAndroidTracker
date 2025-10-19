@@ -3,14 +3,8 @@ package com.openreplay.tracker.listeners
 import android.app.Activity
 import android.app.Application
 import android.os.Bundle
-import com.openreplay.tracker.OpenReplay
 
-/**
- * Czysty forwarder cyklu życia.
- * Nie startuje/nie zatrzymuje sam sesji — robi to OpenReplay (autoRecording) lub ręcznie przez API.
- */
 class LifecycleManager(
-    private val app: Application,
     private val onEvent: (Event, Activity) -> Unit
 ) : Application.ActivityLifecycleCallbacks {
 

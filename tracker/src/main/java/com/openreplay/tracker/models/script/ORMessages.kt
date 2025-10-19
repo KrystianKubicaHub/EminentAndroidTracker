@@ -111,61 +111,6 @@ class ORMobileCrash(
     }
 }
 
-class ORMobileInternalError(
-    val content: String,
-) : ORMessage(ORMessageType.MobileInternalError) {
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(content))
-    }
-
-    override fun toString(): String {
-        return "-->> MobileInternalError(104): timestamp: $timestamp content: $content"
-    }
-}
-
-class ORMobileViewComponentEvent(
-    val screenName: String,
-    val viewName: String,
-    val visible: Boolean,
-) : ORMessage(ORMessageType.MobileViewComponentEvent) {
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(screenName, viewName, visible))
-    }
-
-    override fun toString(): String {
-        return "-->> MobileViewComponentEvent(98): timestamp: $timestamp screenName: $screenName viewName: $viewName visible: $visible"
-    }
-}
-
-class ORMobileInputEvent(
-    val label: String,
-    val value: String,
-    val valueMasked: Boolean,
-) : ORMessage(ORMessageType.MobileInputEvent) {
-
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(value, valueMasked, label))
-    }
-
-    override fun toString(): String {
-        return "-->> MobileInputEvent(101): timestamp: $timestamp label: $label value: $value"
-    }
-}
-
-class ORMobileMetadata(
-    val key: String,
-    val value: String,
-) : ORMessage(ORMessageType.MobileMetadata) {
-
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(key, value))
-    }
-
-    override fun toString(): String {
-        return "-->> MobileMetadata(92): timestamp: $timestamp key: $key value: $value"
-    }
-}
-
 class ORMobileLog(
     val severity: String,
     val content: String,
@@ -219,35 +164,6 @@ class ORMobileNetworkCall(
 
     override fun toString(): String {
         return "-->> MobileNetworkCall(105): timestamp: $timestamp type: $type method: $method URL: $URL request: $request response: $response status: $status duration: $duration"
-    }
-}
-
-class ORMobileClickEvent(
-    val label: String,
-    val x: Float,
-    val y: Float,
-) : ORMessage(ORMessageType.MobileClickEvent) {
-
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(label, x.toULong(), y.toULong()))
-    }
-
-    override fun toString(): String {
-        return "-->> MobileClickEvent(100): timestamp: $timestamp label: $label x: $x y: $y"
-    }
-}
-
-class ORMobilePerformanceEvent(
-    val name: String,
-    val value: ULong,
-) : ORMessage(ORMessageType.MobilePerformanceEvent) {
-
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(name, value))
-    }
-
-    override fun toString(): String {
-        return "-->> MobilePerformanceEvent(102): timestamp: $timestamp name: $name value: $value"
     }
 }
 
@@ -310,23 +226,6 @@ class ORMobileUserID(
     }
 }
 
-class ORMobileSwipeEvent(
-    val label: String,
-    val direction: String,
-    val x: Float,
-    val y: Float,
-) : ORMessage(ORMessageType.MobileSwipeEvent) {
-
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(fromValues(label, x.toULong(), y.toULong(), direction))
-    }
-
-    override fun toString(): String {
-        return "-->> MobileSwipeEvent(106): label: $label timestamp: $timestamp direction: $direction velocityX: $x velocityY: $y"
-    }
-}
-
-
 class ORMobileEvent(
     val name: String,
     val payload: String,
@@ -341,26 +240,3 @@ class ORMobileEvent(
     }
 }
 
-class ORMobileGraphQL(
-    val operationKind: String,
-    val operationName: String,
-    val variables: String,
-    val response: String,
-    val duration: ULong,
-) : ORMessage(ORMessageType.GraphQL) {
-    override fun contentData(): ByteArray {
-        return this.prefixData() + withSize(
-            fromValues(
-                operationKind,
-                operationName,
-                variables,
-                response,
-                duration,
-            )
-        )
-    }
-
-    override fun toString(): String {
-        return "-->> GraphQL(89): timestamp: $timestamp operationKind: $operationKind operationName: $operationName variables: $variables response: $response duration: $duration"
-    }
-}

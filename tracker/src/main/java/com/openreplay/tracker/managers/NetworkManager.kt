@@ -3,7 +3,6 @@ package com.openreplay.tracker.managers
 import android.content.Context
 import android.net.TrafficStats
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import com.openreplay.tracker.OpenReplay
 import com.openreplay.tracker.models.SessionResponse
 import kotlinx.coroutines.*
@@ -21,7 +20,6 @@ object NetworkManager {
     private const val INGEST_URL = "/v1/mobile/i"
     private const val LATE_URL = "/v1/mobile/late"
     private const val IMAGES_URL = "/v1/mobile/images"
-    private const val CONDITIONS = "/v1/mobile/conditions"
     private val networkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     var baseUrl = "https://api.openreplay.com/ingest"
@@ -160,35 +158,6 @@ object NetworkManager {
             } catch (e: Exception) {
                 DebugUtils.log("[Network] sendMessage exception: ${e.message}")
                 withContext(Dispatchers.Main) { completion(false) }
-            } finally {
-                request.disconnect()
-            }
-        }
-    }
-    fun getConditions(completion: (List<ApiResponse>) -> Unit) {
-        networkScope.launch {
-            val tok = token ?: run {
-                DebugUtils.log("[Network] No token for getConditions")
-                withContext(Dispatchers.Main) { completion(emptyList()) }
-                return@launch
-            }
-
-            val request = createRequest(
-                "GET",
-                "$CONDITIONS/$projectId",
-                headers = mapOf("Authorization" to "Bearer $tok")
-            )
-
-            try {
-                request.connect()
-                val json = request.inputStream.bufferedReader().readText()
-                val type = object : TypeToken<Map<String, List<ApiResponse>>>() {}.type
-                val parsed = Gson().fromJson<Map<String, List<ApiResponse>>>(json, type)
-                val conditions = parsed["conditions"] ?: emptyList()
-                withContext(Dispatchers.Main) { completion(conditions) }
-            } catch (e: Exception) {
-                DebugUtils.error("[Network] getConditions parse error: $e")
-                withContext(Dispatchers.Main) { completion(emptyList()) }
             } finally {
                 request.disconnect()
             }

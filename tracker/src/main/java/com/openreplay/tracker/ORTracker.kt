@@ -8,20 +8,13 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
-import android.view.GestureDetector
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import androidx.compose.ui.platform.AbstractComposeView
-import com.google.gson.Gson
 import com.openreplay.tracker.listeners.Crash
 import com.openreplay.tracker.listeners.LifecycleManager
 import com.openreplay.tracker.listeners.LogsListener
-import com.openreplay.tracker.listeners.PerformanceListener
-import com.openreplay.tracker.listeners.sendNetworkMessage
 import com.openreplay.tracker.managers.DebugUtils
 import com.openreplay.tracker.managers.MessageCollector
-import com.openreplay.tracker.managers.MessageHandler
 import com.openreplay.tracker.managers.NetworkManager
 import com.openreplay.tracker.managers.ScreenshotManager
 import com.openreplay.tracker.managers.UserDefaults
@@ -29,7 +22,6 @@ import com.openreplay.tracker.models.OROptions
 import com.openreplay.tracker.models.RecordingQuality
 import com.openreplay.tracker.models.SessionRequest
 import com.openreplay.tracker.models.script.ORMobileEvent
-import com.openreplay.tracker.models.script.ORMobileMetadata
 import com.openreplay.tracker.models.script.ORMobileUserID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,11 +61,9 @@ object OpenReplay {
     private var state: RecorderState = RecorderState.IDLE
     private val isInitialized = AtomicBoolean(false)
     private val autoRecordingEnabled = AtomicBoolean(false)
-
     private var sessionStartTs: Long = 0L
     private var lateMessagesFile: File? = null
     @Volatile private var currentActivity: Activity? = null
-    private var gestureDetector: GestureDetector? = null
 
     private val startedActivities = AtomicInteger(0)
     private var lastBecameBackgroundAt: Long = 0L
@@ -83,8 +73,7 @@ object OpenReplay {
             ?: throw IllegalArgumentException("OpenReplay.initialize requires Application context")
 
         if (isInitialized.getAndSet(true)) {
-            this.options = this.options.merge(options)
-            return
+            throw IllegalArgumentException("OpenReplay has been already initialized")
         }
 
         this.app = application
@@ -95,7 +84,7 @@ object OpenReplay {
         NetworkManager.initialize(application)
         CoroutineScope(Dispatchers.IO).launch { UserDefaults.init(application) }
 
-        lifecycleManager = LifecycleManager(application) { event, activity ->
+        lifecycleManager = LifecycleManager() { event, activity ->
             when (event) {
                 LifecycleManager.Event.ActivityStarted -> {
                     startedActivities.incrementAndGet()
@@ -123,15 +112,6 @@ object OpenReplay {
         checkForLateMessages()
         state = RecorderState.INITIALIZED
     }
-    fun getSessionStartTimestamp(): Long = sessionStartTs
-
-    fun triggerRecordingByCondition(reason: String) {
-        DebugUtils.log("[OpenReplay] Triggered recording by condition: $reason")
-        startRecording()
-    }
-
-
-
     fun enableAutoRecording(enable: Boolean) {
         autoRecordingEnabled.set(enable)
         if (enable && startedActivities.get() > 0 && state == RecorderState.INITIALIZED) {
@@ -144,11 +124,7 @@ object OpenReplay {
     fun startRecording(optionsOverride: OROptions? = null, onStarted: (() -> Unit)? = null) {
         if (!isInitialized.get()) {
             DebugUtils.log("OpenReplay not initialized; call initialize() first")
-            return
-        }
-        if (state == RecorderState.RECORDING) {
-            onStarted?.invoke()
-            return
+            throw IllegalArgumentException("Open replay not initialized")
         }
         if (state == RecorderState.STOPPING) return
 
@@ -159,7 +135,7 @@ object OpenReplay {
 
         SessionRequest.create(appContext!!, doNotRecord = false) { sessionResponse ->
             if (sessionResponse == null) {
-                DebugUtils.log("OpenReplay: no response from /start")
+                DebugUtils.error("OpenReplay: no response from /start")
                 state = RecorderState.INITIALIZED
                 return@create
             }
@@ -174,8 +150,6 @@ object OpenReplay {
                 Crash.init(appContext!!)
                 Crash.start()
             }
-            if (options.performances) PerformanceListener.getInstance(appContext!!).start()
-
             onStarted?.invoke()
         }
     }
@@ -188,7 +162,6 @@ object OpenReplay {
 
         ScreenshotManager.stop()
         LogsListener.stop()
-        PerformanceListener.getInstance(appContext!!).stop()
         Crash.stop()
         MessageCollector.stop()
         if (closeSession) SessionRequest.clear()
@@ -210,7 +183,7 @@ object OpenReplay {
         state = RecorderState.IDLE
     }
 
-    fun updateCurrentActivity(activity: Activity?) {
+    private fun updateCurrentActivity(activity: Activity?) {
         currentActivity = activity
         ScreenshotManager.updateCurrentActivity(activity)
     }
@@ -237,43 +210,16 @@ object OpenReplay {
         MessageCollector.sendMessage(ORMobileUserID(iD = userID))
     }
 
-    fun setMetadata(key: String, value: String) {
-        MessageCollector.sendMessage(ORMobileMetadata(key = key, value = value))
-    }
-
-    fun userAnonymousID(iD: String) {
-        MessageCollector.sendMessage(ORMobileUserID(iD = iD))
-    }
-
     fun addIgnoredView(view: View) = ScreenshotManager.addSanitizedElement(view)
     fun sanitizeView(view: View) = ScreenshotManager.addSanitizedElement(view)
 
-    fun event(name: String, obj: Any?) {
-        val json = obj?.let { Gson().toJson(it) } ?: ""
-        eventStr(name, json)
-    }
 
     fun eventStr(name: String, jsonPayload: String) {
         MessageCollector.sendMessage(ORMobileEvent(name, payload = jsonPayload))
     }
 
-    fun networkRequest(
-        url: String,
-        method: String,
-        requestJSON: String,
-        responseJSON: String,
-        status: Int,
-        duration: ULong
-    ) = sendNetworkMessage(url, method, requestJSON, responseJSON, status, duration)
-
-    fun sendMessage(type: String, msg: Any) = MessageHandler.sendMessage(type, msg)
-
     fun getSessionID(): String = SessionRequest.getSessionId() ?: ""
 
-
-    fun onTouchEvent(event: MotionEvent) {
-        gestureDetector?.onTouchEvent(event)
-    }
 
     private fun getLateMessagesFile(context: Context): File {
         if (lateMessagesFile == null) {

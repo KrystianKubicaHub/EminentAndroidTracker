@@ -30,7 +30,6 @@ object MessageCollector {
 
     fun start(context: Context) {
         CoroutineScope(Dispatchers.IO).launch {
-            // 🔧 getLateMessagesFile() jest private, więc sami tworzymy plik w identyczny sposób:
             val lateFile = File(context.filesDir, "lateMessages.dat")
             lateMessagesFile = lateFile
 
@@ -57,11 +56,6 @@ object MessageCollector {
     }
 
     fun sendMessage(message: ORMessage) {
-        // 🔧 wywołanie ConditionsManager → automatyczne nagranie po spełnieniu warunku
-        ConditionsManager.processMessage(message)?.let { trigger ->
-            OpenReplay.triggerRecordingByCondition(trigger)
-        }
-
         if (OpenReplay.options.debugLogs) {
             if (!message.toString().contains("Log") && !message.toString().contains("NetworkCall")) {
                 DebugUtils.log(message.toString())
@@ -108,7 +102,6 @@ object MessageCollector {
         var sentSize = 0
 
         synchronized(messagesWaiting) {
-            // 🔧 zamiast removeFirst() → removeAt(0) dla kompatybilności z API <35
             while (messagesWaiting.isNotEmpty() && sentSize + messagesWaiting.first().size <= maxMessagesSize) {
                 val msg = messagesWaiting.removeAt(0)
                 messages.add(msg)
@@ -162,7 +155,6 @@ object MessageCollector {
     }
 
     fun cycleBuffer() {
-        // 🔧 już nie resetujemy timestampu (tylko rotacja buforów)
         if (tick % 2 == 0) {
             messagesWaiting.clear()
         } else {
